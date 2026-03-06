@@ -86,6 +86,9 @@ Subfolders nest to any depth. Files outside `/Music/` are ignored.
 ### M5Launcher
 Download the .bin from releases, copy to your sd card and install it via [M5 Launcher](https://github.com/bmorcelli/Launcher)
 
+### M5Burner
+Available on M5Burner
+
 ## Build and upload via Arduino IDE
 
 ### Dependencies
@@ -124,7 +127,7 @@ Install both libraries via the Arduino Library Manager or the links below:
 
 ## Technical notes
 
-**M4A playback** — The player includes a hand-written MP4 container demuxer (`AudioFileSourceM4A`) that parses the `moov` atom tree, extracts the AAC sample table, and streams frames with ADTS headers prepended for `AudioGeneratorAAC`. Duration reading uses an end-of-file first strategy to avoid walking the FAT chain past large `mdat` blocks.
+**M4A playback** — The player includes a bespoke MP4 container demuxer (`AudioFileSourceM4A`) that parses the `moov` atom tree, extracts the AAC sample table, and streams frames with ADTS headers prepended for `AudioGeneratorAAC`. Duration reading uses an end-of-file first strategy to avoid walking the FAT chain past large `mdat` blocks.
 
 **Memory** — Each scanned folder uses ~12KB RAM: a 200-entry name cache (~10KB) plus a 25-entry duration cache for the current page (~2KB). An 11-slot LRU evicts the least recently used folder when memory runs low. The AAC SBR decoder needs ~50KB contiguous; the LRU evicts additional folders before opening an M4A file if the heap is below 80KB.
 
