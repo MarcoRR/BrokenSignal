@@ -1,6 +1,6 @@
 # BROKEN SIGNAL
 
-A cyberpunk audio player for the **M5Stack Cardputer**. Plays MP3 and M4A files from an SD card with folder navigation and five visual themes.
+Audio player for the **M5Stack Cardputer ADV**. Plays MP3 and M4A files from an SD card with folder navigation.
 
 ![Screenshot](images/BrokenSignal.png)
 
