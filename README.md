@@ -84,8 +84,7 @@ Subfolders nest to any depth. Files outside `/Music/` are ignored.
 ## Installation from .bin
 
 ### M5Launcher
-Download the .bin from releases, copy to your sd card and install it via M5 launcher https://github.com/bmorcelli/Launcher
-
+Download the .bin from releases, copy to your sd card and install it via [M5 Launcher]([https://ko-fi.com/marcorr](https://github.com/bmorcelli/Launcher))
 
 ## Build and upload via Arduino IDE
 
