@@ -4,7 +4,7 @@ Audio player for the **M5Stack Cardputer ADV**. Plays MP3 and M4A files from an 
 
 ![Screenshot](images/BrokenSignal.png)
 
-> Support: [Ko-fi](https://ko-fi.com/marcorr)  
+>> Support: [Ko-fi](https://ko-fi.com/marcorr)  
 
 ---
 
