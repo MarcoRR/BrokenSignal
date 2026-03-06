@@ -114,6 +114,7 @@ Install both libraries via the Arduino Library Manager or the links below:
 
 ## Screenshots
 
+![Glitch Terminal theme](images/cardputer.png)
 ![Glitch Terminal theme](images/theme2.png)
 ![Corpo Chrome theme](/images/theme3.png)
 ![Miami Vice theme](images/theme4.png)
