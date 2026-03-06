@@ -33,7 +33,7 @@ Audio player for the **M5Stack Cardputer ADV**. Plays MP3 and M4A files from an 
 | `4` | Miami Vice | Hot pink + turquoise on dark navy |
 | `5` | Ash | Monochrome white-on-black |
 
-![Theme glitch terminal](images/BrokenSignal1.jpg)
+There are a few **screenshots** the bottom of this readme.
 
 ---
 
