@@ -12,7 +12,7 @@ Audio player and web radio for the **M5Stack Cardputer ADV**. Plays MP3 and M4A 
 
 - **Help overlay** — press H at any time, context-aware for current mode
 - **MP3 and M4A (AAC-LC) playback** — native iTunes M4A support via a custom MP4 demuxer, no conversion needed
-- **Web radio streaming** — press W to switch to radio mode and stream internet stations over WiFi
+- **Web radio streaming** — press W to switch to radio mode and stream internet stations (MP3) over WiFi
 - **Folder navigation** — full subfolder tree under `/Music/`, with lazy scanning so startup is instant
 - **Large folder support** — folders with 200+ tracks paginated in pages of 25
 - **Five themes** — switch live with keys 1–5, applied consistently across both player and radio UI
