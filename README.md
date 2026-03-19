@@ -1,6 +1,6 @@
 # BROKEN SIGNAL
 
-Audio player and web radio for the **M5Stack Cardputer ADV**. Plays MP3 and M4A files with folder navigation, and streams internet radio stations over WiFi.
+Audio player and web radio for the **M5Stack Cardputer ADV**. Plays MP3 and M4A files with folder navigation, and streams internet radio stations (MP3) over WiFi.
 
 ![Screenshot](images/BrokenSignal.png)
 
