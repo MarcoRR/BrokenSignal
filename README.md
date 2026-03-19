@@ -1,6 +1,6 @@
 # BROKEN SIGNAL
 
-Audio player for the **M5Stack Cardputer ADV**. Plays MP3 and M4A files from an SD card with folder navigation.
+Audio player and web radio for the **M5Stack Cardputer ADV**. Plays MP3 and M4A files with folder navigation, and streams internet radio stations over WiFi.
 
 ![Screenshot](images/BrokenSignal.png)
 
@@ -10,16 +10,17 @@ Audio player for the **M5Stack Cardputer ADV**. Plays MP3 and M4A files from an 
 
 ## Features
 
+- **Help overlay** — press H at any time, context-aware for current mode
 - **MP3 and M4A (AAC-LC) playback** — native iTunes M4A support via a custom MP4 demuxer, no conversion needed
+- **Web radio streaming** — press W to switch to radio mode and stream internet stations over WiFi
 - **Folder navigation** — full subfolder tree under `/Music/`, with lazy scanning so startup is instant
 - **Large folder support** — folders with 200+ tracks paginated in pages of 25
-- **Five themes** — switch live with keys 1–5
+- **Five themes** — switch live with keys 1–5, applied consistently across both player and radio UI
 - **Repeat modes** — off / one / all
 - **Shuffle**
 - **Recent tracks** — virtual folder showing the last 10 played
 - **Persistent settings** — theme, volume, repeat, and shuffle saved to `/Music/settings.cfg` between reboots
 - **Screen off** — option to turn off display power while audio continues
-- **Help overlay** — press H at any time
 
 ---
 
@@ -39,6 +40,8 @@ There are a few **screenshots** the bottom of this readme.
 
 ## Controls
 
+### Music player
+
 | Key | Action |
 |-----|--------|
 | `;` / `.` | Cursor up / down |
@@ -51,9 +54,35 @@ There are a few **screenshots** the bottom of this readme.
 | `-` | Volume down |
 | `R` | Cycle repeat mode (off → one → all) |
 | `S` | Toggle shuffle |
+| `W` | Switch to web radio mode |
 | `O` | Screen on / off |
 | `H` | Help overlay |
 | `1`–`5` | Switch theme |
+
+### Web radio
+
+| Key | Action |
+|-----|--------|
+| `;` / `.` | Cursor up / down the station list |
+| `ENTER` / `SPACE` | Play selected station · Press again to stop |
+| `A` | Add station — prompts for URL then name |
+| `X` | Remove selected station (with confirmation) |
+| `+` / `=` | Volume up |
+| `-` | Volume down |
+| `W` / `DEL` | Return to music player |
+| `O` | Screen on / off |
+| `H` | Help overlay |
+| `1`–`5` | Switch theme |
+
+### WiFi overlay
+
+When no saved credentials are found, a network list appears automatically.
+
+| Key | Action |
+|-----|--------|
+| `;` / `.` | Scroll network list |
+| `ENTER` | Select network · prompts for password |
+| `DEL` | Cancel / dismiss |
 
 ---
 
@@ -71,13 +100,16 @@ SD/
 └── Music/
     ├── track.mp3
     ├── track.m4a
-    ├── settings.cfg        ← auto-created on first save, you don't need to add this manually
+    ├── settings.cfg           ← theme, volume, repeat, shuffle (auto-created)
+    ├── _radio/
+    │   ├── webradio.cfg       ← saved station list (auto-created)
+    │   └── wifi.cfg           ← WiFi credentials (auto-created on first connect)
     └── Album Folder/
         ├── 01 - Track.mp3
         └── 02 - Track.m4a
 ```
 
-Subfolders nest to any depth. Files outside `/Music/` are ignored.
+Subfolders nest to any depth. The `_radio/` folder is automatically skipped by the music scanner. All config files are created automatically by the app; you do not need to create them manually.
 
 ---
 
@@ -137,3 +169,5 @@ Install both libraries via the Arduino Library Manager or the links below:
 AI models were heavily used to create this code. You may want to hire a team of lawyers to determine what kind of licence it ends up falling under. If you do, let me know — I genuinely have no clue.
 
 As for my personal preference: simply mention the name of this repository and link back to it if you reuse or redistribute this code.
+
+Thanks to [earlephilhower](https://github.com/earlephilhower/ESP8266Audio/tree/master) for the audio library that made this possible.
