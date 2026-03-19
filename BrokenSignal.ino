@@ -10,8 +10,12 @@
  * ── SD Card ───────────────────────────────────────────────────
  *    Format FAT32 — put .mp3 or .m4a files anywhere under /Music/
  *    Subfolders supported. Large folders paginated (25 items/page).
+ *    /Music/settings.cfg       — theme/volume/repeat/shuffle
+ *    /Music/_radio/webradio.cfg — saved radio station list (name|url per line)
+ *    /Music/_radio/wifi.cfg     — WiFi credentials (ssid=X / password=Y)
+ *    (the radio/ subfolder is skipped by the music scanner)
  *
- * ── Keyboard Controls ─────────────────────────────────────────
+ * ── Keyboard Controls (Music Player) ─────────────────────────
  *    ;  /  .      Cursor up / down
  *    ENTER        Open folder / Play track  (press again to stop)
  *    DEL          Back to parent folder
@@ -21,6 +25,19 @@
  *    -            Volume down
  *    R            Cycle repeat mode  (off / one / all)
  *    S            Toggle shuffle
+ *    W            Switch to Web Radio
+ *    O            Screen on / off
+ *    H            Help overlay
+ *    1 – 5        Switch theme
+ *
+ * ── Keyboard Controls (Web Radio) ────────────────────────────
+ *    ;  /  .      Cursor up / down
+ *    ENTER/SPACE  Play / Stop selected station
+ *    A            Add station (URL input)
+ *    X            Remove selected station
+ *    W / DEL      Return to music player
+ *    +  or  =     Volume up
+ *    -            Volume down
  *    O            Screen on / off
  *    H            Help overlay
  *    1 – 5        Switch theme
@@ -44,6 +61,10 @@
 #include <AudioOutput.h>
 #include <algorithm>
 #include <vector>
+// Web radio additions
+#include <WiFi.h>
+#include <AudioFileSourceHTTPStream.h>
+#include <AudioFileSourceBuffer.h>
 
 // =====================================================================
 //  AudioFileSourceM4A  — iTunes M4A (AAC-LC in MP4 container) demuxer
@@ -637,6 +658,59 @@ int           folderPage   = 0;   // current pagination page (0-based) for large
 #define PAGE_SIZE            25   // max items shown per page; BACK/MORE injected when exceeded
 #define NAME_CACHE_MAX      200   // max track NameEntries kept per large folder (~10KB)
 
+// ── Web Radio constants ────────────────────────────────────────
+#define RADIO_MAX           20    // max stored radio stations
+#define RADIO_HTTP_BUF    4096    // HTTP stream ring-buffer size (bytes)
+#define WIFI_TIMEOUT     15000    // WiFi connect timeout (ms)
+#define WIFI_SCAN_MAX       10    // max WiFi networks to list
+#define RADIO_INPUT_MAX    200    // max URL/name/password input length
+
+// ── Web Radio data structures ──────────────────────────────────
+struct RadioEntry {
+    String name;
+    String url;
+};
+
+struct WifiNet {
+    String  ssid;
+    int32_t rssi;
+    bool    encrypted;
+};
+
+// ── Web Radio state ────────────────────────────────────────────
+bool     webRadioMode   = false;
+bool     wifiConnected  = false;
+String   wifiSSID       = "";
+
+RadioEntry radioList[RADIO_MAX];
+int      radioCount     = 0;
+int      radioSelected  = 0;      // cursor position
+int      radioScrollTop = 0;      // first visible index
+int      radioPlaying   = -1;     // index of streaming station (-1 = none)
+bool     radioIsPlaying = false;
+
+AudioFileSourceHTTPStream* httpSrc  = nullptr;
+AudioFileSourceBuffer*     radioBuf = nullptr;
+AudioGeneratorMP3*         radioMp3 = nullptr;
+
+// WiFi scan results
+WifiNet  wifiNets[WIFI_SCAN_MAX];
+int      wifiNetCount   = 0;
+int      wifiNetSel     = 0;
+int      wifiNetScroll  = 0;
+
+// Overlay visibility flags
+bool     wifiOverlayVisible    = false;
+bool     wifiPassOverlayVisible= false;
+bool     addUrlOverlayVisible  = false;
+bool     addNameOverlayVisible = false;
+bool     removeConfirmVisible  = false;
+
+// Text input shared buffer (URL, name, password)
+char     inputBuf[RADIO_INPUT_MAX + 1] = "";
+int      inputLen = 0;
+String   inputSaved = "";   // stores URL while name overlay is open, or SSID while password overlay is open
+
 String        recentPaths[RECENT_MAX];
 int           recentCount = 0;
 
@@ -653,7 +727,7 @@ unsigned long batteryLastMs   = 0;        // millis() of last battery read
 // ── Sprites ───────────────────────────────────────────────────
 M5Canvas statusCanvas(&M5Cardputer.Display);
 M5Canvas headerCanvas(&M5Cardputer.Display);
-// (help overlay draws directly to display — no sprite needed)
+
 bool          toastActive  = false;
 unsigned long toastEnd     = 0;
 char          hdrMsg[20]   = "";     // short message shown below counter in header
@@ -701,6 +775,39 @@ String shortName(const String &p, int maxCh);
 String folderName(const String &p, int maxCh);
 String formatTime(unsigned long ms);
 unsigned long estimateDuration(int idx);
+// Web radio forward declarations
+void  enterWebRadioMode();
+void  exitWebRadioMode();
+void  purgeAudioPlayerMemory();
+void  loadRadioList();
+void  saveRadioList();
+String generateRadioName(const String& url, int n);
+void  startRadioStream(int idx);
+void  stopRadioStream();
+void  purgeRadioMemory();
+void  pumpRadioAudio();
+bool  loadWifiConfig(String& ssid, String& pass);
+void  saveWifiConfig(const String& ssid, const String& pass);
+bool  connectWifi(const String& ssid, const String& pass);
+void  scanWifiNetworks();
+void  showWifiOverlay();
+void  showWifiPassOverlay(const String& ssid);
+void  showAddUrlOverlay();
+void  showAddNameOverlay(const String& defaultName);
+void  showRemoveConfirm();
+void  drawWifiOverlay();
+void  drawWifiPassOverlay(bool inputOnly = false);
+void  drawAddUrlOverlay(bool inputOnly = false);
+void  drawAddNameOverlay(bool inputOnly = false);
+void  drawRemoveConfirm();
+void  drawRadioAll();
+void  drawRadioHeader();
+void  drawRadioRow(int idx);
+void  drawRadioList();
+void  drawRadioStatus();
+void  handleRadioInput(Keyboard_Class::KeysState& ks);
+void  handleOverlayInput(Keyboard_Class::KeysState& ks);
+void  radioScrollEnsureVisible();
 
 // =============================================================
 //  drawSplash  — cyberpunk boot screen for BROKEN SIGNAL
@@ -792,6 +899,16 @@ void drawSplash(const char* statusLine) {
 // =============================================================
 void setup() {
     Serial.begin(115200);
+
+    // Kill WiFi immediately — prevents the ESP32 from auto-resuming a previous
+    // WiFi session stored in NVS, which would consume ~100 KB of heap before
+    // the SD card and audio pipeline are even initialised.
+    // persistent(false) must come first: it stops the WiFi driver from writing
+    // credentials to NVS on the next WiFi.begin(), so future reboots never
+    // attempt a background auto-reconnect at all.
+    WiFi.persistent(false);
+    WiFi.mode(WIFI_OFF);
+
     auto cfg = M5.config();
     M5Cardputer.begin(cfg, true);
     M5Cardputer.Speaker.begin();
@@ -812,8 +929,6 @@ void setup() {
     output = new AudioOutputM5Speaker(&M5Cardputer.Speaker, 0);
     statusCanvas.createSprite(SCREEN_W, STATUS_H);
     headerCanvas.createSprite(SCREEN_W, HEADER_H);
-    // Help overlay draws directly to display (zero heap cost).
-    // a large contiguous block free for the AAC SBR decoder at play time.
 
     allFolders.clear();
     scanDir("/Music", "Music");
@@ -839,11 +954,13 @@ void loop() {
     M5Cardputer.update();
 
     // Audio must be pumped every iteration — highest priority
-    pumpAudio();
+    if (webRadioMode) pumpRadioAudio();
+    else              pumpAudio();
     // Yield after pump: lets RTOS speaker-DMA task run, reduces CPU burn.
     // 1ms while playing (safe — 69ms triple-buffer headroom at 44100Hz).
     // 10ms while idle — cuts CPU ~50x with no perceptible input latency.
-    delay(isPlaying ? 1 : 10);
+    bool anyPlaying = isPlaying || radioIsPlaying;
+    delay(anyPlaying ? 1 : 10);
 
     // Keyboard
     if (!isScanning && M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed()) {
@@ -856,6 +973,17 @@ void loop() {
             return;
         }
 
+        // ── Web Radio mode — route all input there ────────────
+        if (webRadioMode) {
+            bool overlayOpen = wifiOverlayVisible || wifiPassOverlayVisible ||
+                               addUrlOverlayVisible || addNameOverlayVisible ||
+                               removeConfirmVisible;
+            if (overlayOpen) handleOverlayInput(ks);
+            else             handleRadioInput(ks);
+            return;
+        }
+
+        // ── Music player mode ─────────────────────────────────
         if (ks.enter) enterItem(selectedItem);
         if (ks.del)   goBack();
 
@@ -946,6 +1074,8 @@ void loop() {
                 case 'o': case 'O': toggleScreen(); break;
                 // ── Help overlay ─────────────────────────────
                 case 'h': case 'H': toggleHelp(); break;
+                // ── Switch to Web Radio ──────────────────────
+                case 'w': case 'W': enterWebRadioMode(); return;
             }
         }
     }
@@ -955,18 +1085,42 @@ void loop() {
     if (!helpVisible && millis() - lastDraw >= 500) {
         lastDraw = millis();
         cursorVisible = !cursorVisible;
-        // Redraw header when blinking elements are active:
-        // Terminal: cursor blinks only while playing or a track is selected
-        // Others: only while playing (state icon blinks)
-        bool terminalNeedsBlink = (themeIdx == 1) &&
-            (isPlaying || isPaused ||
-             (selectedItem >= 0 && selectedItem < (int)items.size() &&
-              !items[selectedItem].isFolder));
-        bool headerNeedsBlink = terminalNeedsBlink || isPlaying;
-        if (headerNeedsBlink) drawHeader();
-        // Status bar only needs updating while playing (elapsed time moves).
-        // Paused/stopped: bar is static, skip the redraw to save CPU.
-        if (isPlaying) drawStatus();
+
+        if (webRadioMode) {
+            // Suppress blink redraws while any overlay is covering the screen —
+            // same guard as helpVisible, prevents header/status painting over overlays.
+            bool overlayOpen = wifiOverlayVisible || wifiPassOverlayVisible ||
+                               addUrlOverlayVisible || addNameOverlayVisible ||
+                               removeConfirmVisible;
+            if (!overlayOpen) {
+                // Header only needs redrawing when something actually animates:
+                // - any theme while streaming (blinking LIVE / ON AIR indicator)
+                // - Terminal theme cursor blinks in header when streaming
+                if (radioIsPlaying) { drawRadioHeader(); drawRadioStatus(); }
+                // Terminal: blink cursor in the list — single fillRect, no row redraw
+                if (themeIdx == 1 && radioCount > 0) {
+                    if (!radioIsPlaying) drawRadioHeader(); // still need header blink for terminal
+                    int visIdx = radioSelected - radioScrollTop;
+                    if (visIdx >= 0 && visIdx < VISIBLE_TRACKS) {
+                        int y   = LIST_Y + visIdx * LIST_ITEM_H;
+                        uint16_t cur = cursorVisible ? T->accent1 : T->bg;
+                        M5Cardputer.Display.fillRect(SCREEN_W - 7 - 8, y + 3, 5, LIST_ITEM_H - 6, cur);
+                    }
+                }
+            }
+        } else {
+            // Redraw header when blinking elements are active:
+            // Terminal: cursor blinks only while playing or a track is selected
+            // Others: only while playing (state icon blinks)
+            bool terminalNeedsBlink = (themeIdx == 1) &&
+                (isPlaying || isPaused ||
+                 (selectedItem >= 0 && selectedItem < (int)items.size() &&
+                  !items[selectedItem].isFolder));
+            bool headerNeedsBlink = terminalNeedsBlink || isPlaying;
+            if (headerNeedsBlink) drawHeader();
+            // Status bar only needs updating while playing (elapsed time moves).
+            if (isPlaying) drawStatus();
+        }
     }
 
     // Toast expiry — repaint only if help is not covering the screen
@@ -978,10 +1132,13 @@ void loop() {
     // Header message expiry — redraw header to clear it
     if (hdrMsgEnd > 0 && millis() >= hdrMsgEnd) {
         hdrMsgEnd = 0;
-        if (!helpVisible) drawHeader();
+        if (!helpVisible) {
+            if (webRadioMode) drawRadioHeader();
+            else              drawHeader();
+        }
     }
 
-    // Deferred settings save — write only when not playing and 2s after last change
+    // Deferred settings save — safe to write during radio streaming (SD ≠ WiFi)
     if (settingsDirty && !isPlaying && !isPaused &&
         millis() - settingsDirtyMs >= 2000) {
         saveSettings();
@@ -993,7 +1150,10 @@ void loop() {
     if (batteryLevel < 0 || millis() - batteryLastMs >= BATTERY_INTERVAL) {
         batteryLevel  = (int)min((int32_t)99, M5.Power.getBatteryLevel());
         batteryLastMs = millis();
-        if (!helpVisible) drawStatus();
+        if (!helpVisible) {
+            if (webRadioMode) drawRadioStatus();
+            else              drawStatus();
+        }
     }
 }
 
@@ -1231,6 +1391,10 @@ void scanFolderNow(int idx) {
             if (nm.isEmpty() || nm.startsWith(".")) { f.close(); continue; }
             String lo = nm; lo.toLowerCase();
             String fullPath = fe.path + "/" + nm;
+
+            // Skip the radio config subfolder — it holds webradio.cfg / wifi.cfg,
+            // not music.  Checking the lowercased name keeps it case-insensitive.
+            if (f.isDirectory() && lo == "_radio") { f.close(); continue; }
 
             if (f.isDirectory()) {
                 subDirs.push_back(fullPath);
@@ -1551,6 +1715,32 @@ unsigned long estimateDuration(int idx) {
 }
 
 // =============================================================
+//  evictFolderCachesForHeap — evict LRU folder caches until free
+//  heap exceeds `threshold` bytes (or there is nothing left to evict).
+//  Skips the root folder (0) and the currently displayed folder so
+//  the browser view stays intact.
+// =============================================================
+static void evictFolderCachesForHeap(uint32_t threshold) {
+    int pass = 0;
+    while (ESP.getFreeHeap() < threshold && pass < scanLRUCount) {
+        for (int i = scanLRUCount - 1; i >= 0; i--) {
+            int evict = scanLRU[i];
+            if (evict == 0 || evict == currentFolderIdx) continue;
+            allFolders[evict].tracks.clear();    allFolders[evict].tracks.shrink_to_fit();
+            allFolders[evict].nameCache.clear(); allFolders[evict].nameCache.shrink_to_fit();
+            allFolders[evict].scanned        = false;
+            allFolders[evict].nameCacheReady = false;
+            allFolders[evict].nameCacheStart  = 0;
+            allFolders[evict].trackWindowPage = -1;
+            for (int j = i; j < scanLRUCount - 1; j++) scanLRU[j] = scanLRU[j+1];
+            scanLRUCount--;
+            break;
+        }
+        pass++;
+    }
+}
+
+// =============================================================
 void startTrack(int idx) {
     stopAudio();
     // Dismiss help if open when a track starts
@@ -1570,29 +1760,8 @@ void startTrack(int idx) {
     output->begin();
 
     if (lo.endsWith(".m4a")) {
-        // AAC SBR decoder needs ~50KB contiguous. Evict LRU scanned folders
-        // (skipping root and current) until free heap is above 80KB threshold.
-        const uint32_t HEAP_THRESHOLD = 80 * 1024;
-        int evictPass = 0;
-        while (ESP.getFreeHeap() < HEAP_THRESHOLD && evictPass < scanLRUCount) {
-            // Find LRU entry that is not root and not current folder
-            for (int i = scanLRUCount - 1; i >= 0; i--) {
-                int evict = scanLRU[i];
-                if (evict == 0 || evict == currentFolderIdx) continue;
-                allFolders[evict].tracks.clear();
-                allFolders[evict].tracks.shrink_to_fit();
-                allFolders[evict].nameCache.clear();
-                allFolders[evict].nameCache.shrink_to_fit();
-                allFolders[evict].scanned        = false;
-                allFolders[evict].nameCacheReady = false;
-                allFolders[evict].nameCacheStart  = 0;
-                allFolders[evict].trackWindowPage = -1;
-                for (int j = i; j < scanLRUCount - 1; j++) scanLRU[j] = scanLRU[j+1];
-                scanLRUCount--;
-                break;
-            }
-            evictPass++;
-        }
+        // AAC-SBR decoder needs ~50 KB contiguous — evict LRU caches first.
+        evictFolderCachesForHeap(80 * 1024);
 
         m4aSrc = new AudioFileSourceM4A();
         aac = new AudioGeneratorAAC();
@@ -1607,6 +1776,9 @@ void startTrack(int idx) {
             return;
         }
     } else {
+        // MP3 decoder needs ~30–40 KB contiguous — evict LRU caches if needed.
+        evictFolderCachesForHeap(60 * 1024);
+
         // When browsing recent tracks the path may no longer exist on SD.
         // Normal folder browsing is always in sync so skip the extra lookup there.
         if (isRecentView && !SD.exists(path.c_str())) {
@@ -1732,6 +1904,7 @@ void toggleShuffle() {
 //  Full repaint — yields to audio between heavy sections
 // =============================================================
 void drawAll() {
+    if (webRadioMode) { drawRadioAll(); return; }
     // No fillScreen() — each sub-function clears its own region atomically,
     // avoiding the full-screen flash that caused glitching.
     drawHeader();
@@ -2456,32 +2629,58 @@ void drawHelp() {
     D.drawRect(5, 5, SCREEN_W-10, SCREEN_H-10, T->textDim);
 
     struct Row { const char* key; const char* desc; };
-    static const Row rows[] = {
-        { "ENTER",   "Open folder / Play track" },
-        { "DEL",     "Back to parent folder"    },
-        { "SPACE",   "Pause / Resume"           },
-        { "; / .",   "Cursor up / down"         },
-        { ", / /",   "Prev / Next"             },
-        { "+ / -",   "Volume up / down"         },
-        { "R",       "Cycle repeat mode"        },
-        { "S",       "Toggle shuffle"           },
-        { "1-5",     "Switch theme"             },
-        { "O",       "Screen on / off"          },
-        { "H",       "Close this screen"        },
-    };
-    const int rows_n = sizeof(rows)/sizeof(rows[0]);
-    const int startY = 8;
-    const int rowH   = (SCREEN_H - startY*2) / rows_n;
 
-    for (int i = 0; i < rows_n; i++) {
-        int y = startY + i*rowH + rowH/2;
-        if (i % 2 == 0)
-            D.fillRect(6, startY + i*rowH, SCREEN_W-12, rowH, T->selRow);
-        D.setTextDatum(middle_left);
-        D.setTextColor(T->accent2);
-        D.drawString(rows[i].key,  12, y, 1);
-        D.setTextColor(T->textMid);
-        D.drawString(rows[i].desc, 68, y, 1);
+    if (webRadioMode) {
+        static const Row rows[] = {
+            { "ENTER/SPC", "Play / Stop stream"   },
+            { "; / .",     "Cursor up / down"      },
+            { "A",         "Add radio station"     },
+            { "X",         "Remove station"        },
+            { "W / DEL",   "Back to music player"  },
+            { "+ / -",     "Volume up / down"      },
+            { "1-5",       "Switch theme"          },
+            { "O",         "Screen on / off"       },
+            { "H",         "Close this screen"     },
+        };
+        const int rows_n = sizeof(rows)/sizeof(rows[0]);
+        const int startY = 8;
+        const int rowH   = (SCREEN_H - startY*2) / rows_n;
+        for (int i = 0; i < rows_n; i++) {
+            int y = startY + i*rowH + rowH/2;
+            if (i % 2 == 0) D.fillRect(6, startY + i*rowH, SCREEN_W-12, rowH, T->selRow);
+            D.setTextDatum(middle_left);
+            D.setTextColor(T->accent2);
+            D.drawString(rows[i].key,  12, y, 1);
+            D.setTextColor(T->textMid);
+            D.drawString(rows[i].desc, 72, y, 1);
+        }
+    } else {
+        static const Row rows[] = {
+            { "ENTER",   "Open folder / Play track" },
+            { "DEL",     "Back to parent folder"    },
+            { "SPACE",   "Pause / Resume"           },
+            { "; / .",   "Cursor up / down"         },
+            { ", / /",   "Prev / Next"              },
+            { "+ / -",   "Volume up / down"         },
+            { "W",       "Switch to Web Radio"      },
+            { "R",       "Cycle repeat mode"        },
+            { "S",       "Toggle shuffle"           },
+            { "1-5",     "Switch theme"             },
+            { "O",       "Screen on / off"          },
+            { "H",       "Close this screen"        },
+        };
+        const int rows_n = sizeof(rows)/sizeof(rows[0]);
+        const int startY = 4;
+        const int rowH   = (SCREEN_H - startY*2) / rows_n;
+        for (int i = 0; i < rows_n; i++) {
+            int y = startY + i*rowH + rowH/2;
+            if (i % 2 == 0) D.fillRect(6, startY + i*rowH, SCREEN_W-12, rowH, T->selRow);
+            D.setTextDatum(middle_left);
+            D.setTextColor(T->accent2);
+            D.drawString(rows[i].key,  12, y, 1);
+            D.setTextColor(T->textMid);
+            D.drawString(rows[i].desc, 68, y, 1);
+        }
     }
 }
 
@@ -2636,4 +2835,1165 @@ String formatTime(unsigned long ms) {
     unsigned long s = ms / 1000;
     char b[8]; snprintf(b, sizeof(b), "%02lu:%02lu", s/60, s%60);
     return String(b);
+}
+
+// =============================================================
+// =============================================================
+//  WEB RADIO — Complete implementation
+//  Sections: Persistence | Stream | WiFi | Draw | Input | Mode
+// =============================================================
+// =============================================================
+
+// =============================================================
+//  Radio list persistence — /Music/_radio/webradio.cfg
+//  The radio/ subfolder is explicitly skipped by scanFolderNow so it
+//  never appears as a music folder.
+//  Format: one "name|url" per line, up to RADIO_MAX entries.
+// =============================================================
+void loadRadioList() {
+    radioCount = 0;
+    File f = SD.open("/Music/_radio/webradio.cfg", FILE_READ);
+    if (!f) return;
+    while (f.available() && radioCount < RADIO_MAX) {
+        String line = f.readStringUntil('\n');
+        line.trim();
+        if (line.length() == 0) continue;
+        int sep = line.indexOf('|');
+        if (sep < 0) {
+            // URL-only line: auto-name
+            radioList[radioCount].name = "Radio " + String(radioCount + 1);
+            radioList[radioCount].url  = line;
+        } else {
+            radioList[radioCount].name = line.substring(0, sep);
+            radioList[radioCount].url  = line.substring(sep + 1);
+        }
+        if (radioList[radioCount].url.length() > 0) radioCount++;
+    }
+    f.close();
+}
+
+void saveRadioList() {
+    SD.mkdir("/Music/_radio");   // no-op if already exists
+    File f = SD.open("/Music/_radio/webradio.cfg", FILE_WRITE);
+    if (!f) return;
+    for (int i = 0; i < radioCount; i++)
+        f.printf("%s|%s\n", radioList[i].name.c_str(), radioList[i].url.c_str());
+    f.close();
+}
+
+// =============================================================
+//  WiFi config persistence — /Music/_radio/wifi.cfg
+//  Format: ssid=X\npassword=Y
+// =============================================================
+bool loadWifiConfig(String& ssid, String& pass) {
+    ssid = ""; pass = "";
+    File f = SD.open("/Music/_radio/wifi.cfg", FILE_READ);
+    if (!f) return false;
+    while (f.available()) {
+        String line = f.readStringUntil('\n');
+        line.trim();
+        int eq = line.indexOf('=');
+        if (eq < 0) continue;
+        String key = line.substring(0, eq);
+        String val = line.substring(eq + 1);
+        if (key == "ssid")     ssid = val;
+        if (key == "password") pass = val;
+    }
+    f.close();
+    return ssid.length() > 0;
+}
+
+void saveWifiConfig(const String& ssid, const String& pass) {
+    SD.mkdir("/Music/_radio");   // no-op if already exists
+    File f = SD.open("/Music/_radio/wifi.cfg", FILE_WRITE);
+    if (!f) return;
+    f.printf("ssid=%s\npassword=%s\n", ssid.c_str(), pass.c_str());
+    f.close();
+}
+
+// =============================================================
+//  generateRadioName — extract domain from URL for auto-naming
+// =============================================================
+String generateRadioName(const String& url, int n) {
+    int start = url.indexOf("://");
+    if (start >= 0) {
+        start += 3;
+        int end = url.indexOf('/', start);
+        String domain = (end > 0) ? url.substring(start, end) : url.substring(start);
+        if (domain.startsWith("www.")) domain = domain.substring(4);
+        int dot = domain.lastIndexOf('.');
+        if (dot > 0) domain = domain.substring(0, dot);
+        domain.replace('-', ' ');
+        if (domain.length() > 0 && domain.length() <= 20) {
+            domain.toUpperCase();
+            return domain;
+        }
+    }
+    return "Radio " + String(n);
+}
+
+// =============================================================
+//  purgeAudioPlayerMemory — free ALL music-player heap for WiFi
+// =============================================================
+void purgeAudioPlayerMemory() {
+    stopAudio();
+
+    // Destroy the entire folder tree — every FolderEntry destructor runs,
+    // which automatically frees path/label Strings, nameCache, tracks,
+    // and subFolderIds vectors for every entry.  exitWebRadioMode() always
+    // rebuilds from scratch via scanDir() + loadFolderIdx(), so nothing
+    // is lost by clearing here.
+    allFolders.clear();
+    allFolders.shrink_to_fit();
+
+    // Navigation history and browser view are no longer valid.
+    folderStack.clear();
+    folderStack.shrink_to_fit();
+    items.clear();
+    items.shrink_to_fit();
+
+    scanLRUCount     = 0;
+    currentFolderIdx = 0;
+    folderPage       = 0;
+    isRecentView     = false;
+}
+
+// =============================================================
+//  Radio streaming — start / stop / pump
+// =============================================================
+void startRadioStream(int idx) {
+    if (!wifiConnected || idx < 0 || idx >= radioCount) return;
+    int oldPlaying = radioPlaying;   // save before stopRadioStream() clears it
+    stopRadioStream();
+    output->begin();
+
+    httpSrc  = new AudioFileSourceHTTPStream(radioList[idx].url.c_str());
+    radioBuf = new AudioFileSourceBuffer(httpSrc, RADIO_HTTP_BUF);
+    radioMp3 = new AudioGeneratorMP3();
+
+    if (!radioMp3->begin(radioBuf, output)) {
+        delete radioMp3; radioMp3 = nullptr;
+        delete radioBuf; radioBuf = nullptr;
+        if (httpSrc) { httpSrc->close(); delete httpSrc; httpSrc = nullptr; }
+        radioIsPlaying = false;
+        showHdrMsg("STREAM ERROR");
+        drawRadioAll();
+        return;
+    }
+    radioPlaying   = idx;
+    radioIsPlaying = true;
+    // Only repaint the rows whose state actually changed
+    if (oldPlaying >= 0 && oldPlaying != idx) drawRadioRow(oldPlaying);
+    drawRadioRow(idx);
+    drawRadioHeader();
+    drawRadioStatus();
+}
+
+void stopRadioStream() {
+    if (radioMp3)   { if (radioMp3->isRunning()) radioMp3->stop(); delete radioMp3; radioMp3 = nullptr; }
+    if (radioBuf)   { delete radioBuf; radioBuf = nullptr; }
+    if (httpSrc)    { httpSrc->close(); delete httpSrc; httpSrc = nullptr; }
+    if (output)     output->stop();
+    radioIsPlaying = false;
+    radioPlaying   = -1;
+}
+
+void purgeRadioMemory() {
+    stopRadioStream();
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    wifiConnected = false;
+    delay(100);
+}
+
+void pumpRadioAudio() {
+    if (!radioIsPlaying || !radioMp3) return;
+    if (!radioMp3->isRunning()) {
+        int oldPlaying = radioPlaying;
+        stopRadioStream();
+        showHdrMsg("STREAM LOST");
+        if (oldPlaying >= 0) drawRadioRow(oldPlaying);
+        drawRadioHeader();
+        drawRadioStatus();
+        return;
+    }
+    radioMp3->loop();
+}
+
+// =============================================================
+//  radioScrollEnsureVisible — keep cursor in visible window
+// =============================================================
+void radioScrollEnsureVisible() {
+    if (radioSelected < radioScrollTop)
+        radioScrollTop = radioSelected;
+    if (radioSelected >= radioScrollTop + VISIBLE_TRACKS)
+        radioScrollTop = radioSelected - VISIBLE_TRACKS + 1;
+    if (radioScrollTop < 0) radioScrollTop = 0;
+}
+
+// =============================================================
+//  WiFi — scan and connect
+// =============================================================
+void scanWifiNetworks() {
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();
+    int n = WiFi.scanNetworks(false, false, false, 300);
+    wifiNetCount = 0;
+    for (int i = 0; i < n && wifiNetCount < WIFI_SCAN_MAX; i++) {
+        wifiNets[wifiNetCount].ssid      = WiFi.SSID(i);
+        wifiNets[wifiNetCount].rssi      = WiFi.RSSI(i);
+        wifiNets[wifiNetCount].encrypted = (WiFi.encryptionType(i) != WIFI_AUTH_OPEN);
+        if (wifiNets[wifiNetCount].ssid.length() > 0) wifiNetCount++;
+    }
+    WiFi.scanDelete();
+}
+
+bool connectWifi(const String& ssid, const String& pass) {
+    String truncSsid = ssid;
+    if ((int)truncSsid.length() > 26) truncSsid = truncSsid.substring(0, 25) + ">";
+
+    // Partial-redraw connecting screen — static chrome drawn once, only the
+    // animated "CONNECTING..." line is repainted on subsequent dot ticks.
+    auto drawConnScreen = [&](uint8_t dotCount) {
+        auto& D = M5Cardputer.Display;
+        if (dotCount == 0) {
+            // Full draw on first call only
+            D.fillRect(0, 0, SCREEN_W, SCREEN_H, T->hdrBg);
+            D.drawRect(4, 4, SCREEN_W-8, SCREEN_H-8, T->accent1);
+            D.setTextDatum(middle_center);
+            D.setTextColor(T->accent2);
+            D.drawString("WEB RADIO", SCREEN_W/2, 18, 2);
+            D.setTextColor(T->textMid);
+            D.drawString(truncSsid, SCREEN_W/2, SCREEN_H/2, 1);
+            D.setTextColor(T->textDim);
+            D.drawString("DEL to cancel", SCREEN_W/2, SCREEN_H/2 + 16, 1);
+        }
+        // Only repaint the animating status line (clears a narrow strip)
+        D.fillRect(5, SCREEN_H/2 - 24, SCREEN_W-10, 16, T->hdrBg);
+        char msg[18]; snprintf(msg, sizeof(msg), "CONNECTING%.*s", dotCount, "...");
+        D.setTextDatum(middle_center);
+        D.setTextColor(T->accent1);
+        D.drawString(msg, SCREEN_W/2, SCREEN_H/2 - 16, 1);
+    };
+
+    drawConnScreen(0);
+    WiFi.persistent(false);    // never write credentials to NVS — avoids boot auto-reconnect
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid.c_str(), pass.c_str());
+
+    unsigned long t        = millis();
+    unsigned long lastAnim = millis();
+    uint8_t dots = 0;
+
+    while (WiFi.status() != WL_CONNECTED && millis() - t < WIFI_TIMEOUT) {
+        M5Cardputer.update();
+        if (millis() - lastAnim >= 500) {
+            dots = (dots % 3) + 1;   // cycles 1 → 2 → 3 → 1
+            drawConnScreen(dots);
+            lastAnim = millis();
+        }
+        if (M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed()) {
+            Keyboard_Class::KeysState ks = M5Cardputer.Keyboard.keysState();
+            if (ks.del) { WiFi.disconnect(); return false; }
+        }
+        delay(50);
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+        wifiConnected = true;
+        wifiSSID      = ssid;
+        WiFi.setSleep(true);   // modem sleep between packets — significant power saving
+        saveWifiConfig(ssid, pass);
+        return true;
+    }
+    WiFi.disconnect();
+    wifiConnected = false;
+    auto& D = M5Cardputer.Display;
+    D.fillRect(0, 0, SCREEN_W, SCREEN_H, T->hdrBg);
+    D.drawRect(4, 4, SCREEN_W-8, SCREEN_H-8, T->accent1);
+    D.setTextDatum(middle_center);
+    D.setTextColor(T->accent1);
+    D.drawString("CONNECT FAILED", SCREEN_W/2, SCREEN_H/2 - 8, 1);
+    D.setTextColor(T->textDim);
+    D.drawString("any key to retry", SCREEN_W/2, SCREEN_H/2 + 8, 1);
+    delay(2000);
+    return false;
+}
+
+// =============================================================
+//  Overlay show helpers — set flags and redraw
+// =============================================================
+void showWifiOverlay() {
+    // Show scanning message first
+    M5Cardputer.Display.fillRect(0, 0, SCREEN_W, SCREEN_H, T->hdrBg);
+    M5Cardputer.Display.setTextDatum(middle_center);
+    M5Cardputer.Display.setTextColor(T->accent1);
+    M5Cardputer.Display.drawString("SCANNING WIFI...", SCREEN_W/2, SCREEN_H/2, 1);
+    scanWifiNetworks();
+    wifiNetSel = 0; wifiNetScroll = 0;
+    wifiOverlayVisible = true;
+    drawWifiOverlay();
+}
+
+void showWifiPassOverlay(const String& ssid) {
+    inputSaved = ssid;
+    inputBuf[0] = '\0'; inputLen = 0;
+    wifiPassOverlayVisible = true;
+    drawWifiPassOverlay();
+}
+
+void showAddUrlOverlay() {
+    inputBuf[0] = '\0'; inputLen = 0;
+    addUrlOverlayVisible = true;
+    drawAddUrlOverlay();
+}
+
+void showAddNameOverlay(const String& defaultName) {
+    strncpy(inputBuf, defaultName.c_str(), RADIO_INPUT_MAX);
+    inputBuf[RADIO_INPUT_MAX] = '\0';
+    inputLen = strlen(inputBuf);
+    addNameOverlayVisible = true;
+    drawAddNameOverlay();
+}
+
+void showRemoveConfirm() {
+    removeConfirmVisible = true;
+    drawRemoveConfirm();
+}
+
+// =============================================================
+//  Shared overlay frame helper — draws directly to the display.
+//  Clears the screen then paints the border and title bar once.
+// =============================================================
+static void drawOverlayFrame(const char* title) {
+    auto& D = M5Cardputer.Display;
+    D.fillRect(0, 0, SCREEN_W, SCREEN_H, T->bg);
+    D.drawRect(3, 3, SCREEN_W-6, SCREEN_H-6, T->accent1);
+    D.drawRect(4, 4, SCREEN_W-8, SCREEN_H-8, T->textDim);
+    D.fillRect(4, 4, SCREEN_W-8, 18, T->hdrBg);
+    D.setTextDatum(middle_left);
+    D.setTextColor(T->accent1);
+    D.drawString(title, 10, 13, 1);
+}
+
+// =============================================================
+//  drawWifiOverlay — WiFi network list
+// =============================================================
+void drawWifiOverlay() {
+    auto& D = M5Cardputer.Display;
+    drawOverlayFrame("SELECT WIFI");
+
+    const int LIST_START = 24;
+    const int ROW_H      = 14;
+    const int ROWS_VIS   = 6;    // fits in 24..108
+    const int FOOTER_Y   = 121;
+
+    D.setTextDatum(middle_right);
+    D.setTextColor(T->textDim);
+    D.drawString("SCAN=S  DEL=cancel", SCREEN_W-6, 13, 1);
+
+    if (wifiNetCount == 0) {
+        D.setTextDatum(middle_center);
+        D.setTextColor(T->textDim);
+        D.drawString("No networks found", SCREEN_W/2, 68, 1);
+        D.drawString("Press S to rescan", SCREEN_W/2, 82, 1);
+    } else {
+        for (int i = 0; i < ROWS_VIS; i++) {
+            int idx = wifiNetScroll + i;
+            if (idx >= wifiNetCount) break;
+            int y = LIST_START + i * ROW_H;
+            bool sel = (idx == wifiNetSel);
+            D.fillRect(5, y, SCREEN_W-10, ROW_H, sel ? T->selRow : T->bg);
+            if (sel) D.fillRect(5, y, 3, ROW_H, T->accent1);
+
+            // SSID
+            String ssid = wifiNets[idx].ssid;
+            if ((int)ssid.length() > 24) ssid = ssid.substring(0, 23) + ">";
+            D.setTextDatum(middle_left);
+            D.setTextColor(sel ? T->textBright : T->textMid);
+            D.drawString(ssid, 12, y + ROW_H/2, 1);
+
+            // Lock icon if encrypted
+            if (wifiNets[idx].encrypted) {
+                D.setTextColor(sel ? T->accent3 : T->textDim);
+                D.drawString("*", SCREEN_W - 14, y + ROW_H/2, 1);
+            }
+        }
+        // Scrollbar
+        if (wifiNetCount > ROWS_VIS) {
+            int sbH  = ROWS_VIS * ROW_H;
+            int thH  = max(5, sbH * ROWS_VIS / wifiNetCount);
+            int thY  = LIST_START + (sbH - thH) * wifiNetScroll / max(1, wifiNetCount - ROWS_VIS);
+            D.fillRect(SCREEN_W - 8, LIST_START, 3, sbH, T->barBg);
+            D.fillRect(SCREEN_W - 8, thY, 3, thH, T->accent2);
+        }
+    }
+    D.setTextDatum(middle_center);
+    D.setTextColor(T->textDim);
+    D.drawString("ENTER=connect", SCREEN_W/2, FOOTER_Y, 1);
+}
+
+// =============================================================
+//  drawWifiPassOverlay — password input
+//  inputOnly=true: repaint only the input field (no frame redraw)
+// =============================================================
+void drawWifiPassOverlay(bool inputOnly) {
+    auto& D = M5Cardputer.Display;
+    if (!inputOnly) {
+        drawOverlayFrame("WIFI PASSWORD");
+        D.setTextDatum(middle_left);
+        D.setTextColor(T->textMid);
+        String ssidLine = "Net: " + inputSaved;
+        if ((int)ssidLine.length() > 32) ssidLine = ssidLine.substring(0, 31) + ">";
+        D.drawString(ssidLine, 8, 34, 1);
+        D.drawFastHLine(6, 42, SCREEN_W-12, T->textDim);
+        D.setTextColor(T->textDim);
+        D.setTextDatum(middle_center);
+        D.drawString("ENTER=connect   DEL=back", SCREEN_W/2, 100, 1);
+        D.fillRect(6, 52, SCREEN_W-12, 18, T->hdrBg);
+        D.drawRect(6, 52, SCREEN_W-12, 18, T->accent2);
+    }
+    // Input text — inline bg fill eliminates erase flash; pad to overwrite deleted chars
+    String disp = String(inputBuf) + "_";
+    if ((int)disp.length() > 30) disp = disp.substring((int)disp.length() - 30);
+    while ((int)disp.length() < 30) disp += ' ';
+    D.setTextDatum(middle_left);
+    D.setTextColor(T->textBright, T->hdrBg);
+    D.drawString(disp, 10, 61, 1);
+    D.setTextColor(T->textBright);
+}
+
+// =============================================================
+//  drawAddUrlOverlay — stream URL input
+//  inputOnly=true: repaint only the input field (no frame redraw)
+// =============================================================
+void drawAddUrlOverlay(bool inputOnly) {
+    auto& D = M5Cardputer.Display;
+    if (!inputOnly) {
+        drawOverlayFrame("ADD RADIO STATION");
+        D.setTextDatum(middle_left);
+        D.setTextColor(T->textMid);
+        D.drawString("Enter stream URL:", 8, 34, 1);
+        D.setTextColor(T->textDim);
+        D.setTextDatum(middle_center);
+        D.drawString("Tip: http:// stream URL", SCREEN_W/2, 80, 1);
+        D.drawString("ENTER=next   DEL=backspace", SCREEN_W/2, 100, 1);
+        D.drawString("DEL on empty=cancel", SCREEN_W/2, 112, 1);
+        D.fillRect(6, 44, SCREEN_W-12, 18, T->hdrBg);
+        D.drawRect(6, 44, SCREEN_W-12, 18, T->accent2);
+    }
+    // Input text — inline bg fill eliminates erase flash; pad to overwrite deleted chars
+    String disp = String(inputBuf) + "_";
+    if ((int)disp.length() > 30) disp = disp.substring((int)disp.length() - 30);
+    while ((int)disp.length() < 30) disp += ' ';
+    D.setTextDatum(middle_left);
+    D.setTextColor(T->textBright, T->hdrBg);
+    D.drawString(disp, 10, 53, 1);
+    D.setTextColor(T->textBright);
+}
+
+// =============================================================
+//  drawAddNameOverlay — station name input
+//  inputOnly=true: repaint only the input field (no frame redraw)
+// =============================================================
+void drawAddNameOverlay(bool inputOnly) {
+    auto& D = M5Cardputer.Display;
+    if (!inputOnly) {
+        drawOverlayFrame("STATION NAME");
+        D.setTextDatum(middle_left);
+        D.setTextColor(T->textMid);
+        D.drawString("Name (or ENTER to accept):", 8, 34, 1);
+        D.setTextColor(T->textDim);
+        D.setTextDatum(middle_center);
+        D.drawString("ENTER=add station   DEL=backspace", SCREEN_W/2, 100, 1);
+        D.fillRect(6, 44, SCREEN_W-12, 18, T->hdrBg);
+        D.drawRect(6, 44, SCREEN_W-12, 18, T->accent2);
+    }
+    // Input text — inline bg fill eliminates erase flash; pad to overwrite deleted chars
+    String disp = String(inputBuf) + "_";
+    if ((int)disp.length() > 30) disp = disp.substring((int)disp.length() - 30);
+    while ((int)disp.length() < 30) disp += ' ';
+    D.setTextDatum(middle_left);
+    D.setTextColor(T->textBright, T->hdrBg);
+    D.drawString(disp, 10, 53, 1);
+    D.setTextColor(T->textBright);
+}
+
+// =============================================================
+//  drawRemoveConfirm — confirm before deleting a station
+// =============================================================
+void drawRemoveConfirm() {
+    auto& D = M5Cardputer.Display;
+    drawOverlayFrame("REMOVE STATION?");
+
+    String name = (radioCount > 0 && radioSelected < radioCount)
+                  ? radioList[radioSelected].name : "?";
+    if ((int)name.length() > 28) name = name.substring(0, 27) + ">";
+
+    D.setTextDatum(middle_center);
+    D.setTextColor(T->textBright);
+    D.drawString(name, SCREEN_W/2, 55, 1);
+    D.setTextColor(T->textDim);
+    D.drawString("This will be deleted.", SCREEN_W/2, 75, 1);
+    D.setTextColor(T->accent1);
+    D.drawString("ENTER=remove", SCREEN_W/2, 100, 1);
+    D.setTextColor(T->textMid);
+    D.drawString("DEL=cancel", SCREEN_W/2, 114, 1);
+}
+
+// =============================================================
+//  drawRadioHeader — header for web radio view (per theme)
+// =============================================================
+void drawRadioHeader() {
+    #define D headerCanvas
+    D.fillRect(0, 0, SCREEN_W, HEADER_H, T->hdrBg);
+
+    // Top row: mode label + WiFi status
+    String wifiStatus = wifiConnected ? wifiSSID : "NOT CONNECTED";
+    if ((int)wifiStatus.length() > 20) wifiStatus = wifiStatus.substring(0, 19) + ">";
+
+    // Bottom row: current station name or prompt
+    String stationLine = "-- SELECT STATION --";
+    if (radioIsPlaying && radioPlaying >= 0 && radioPlaying < radioCount)
+        stationLine = radioList[radioPlaying].name;
+    if ((int)stationLine.length() > 24) stationLine = stationLine.substring(0, 23) + ">";
+
+    // ── NEON NOIR ─────────────────────────────────────────────
+    if (themeIdx == 0) {
+        D.fillRect(0, 0, 3, HEADER_H, T->accent1);
+        D.setTextDatum(middle_left);
+        D.setTextColor(radioIsPlaying ? T->accent1 : T->textDim);
+        D.drawString(radioIsPlaying ? ">> LIVE" : "-  RADIO", 8, 7, 1);
+        D.setTextColor(wifiConnected ? T->accent3 : T->accent1);
+        D.setTextDatum(middle_right);
+        D.drawString(wifiStatus, SCREEN_W-4, 7, 1);
+        D.setTextColor(T->accent2);
+        D.setTextDatum(middle_left);
+        D.drawString(stationLine, 8, 22, 2);
+        D.drawFastHLine(3, HEADER_H-2, SCREEN_W-3, T->accent1);
+        D.drawFastHLine(3, HEADER_H-1, SCREEN_W-3, T->textDim);
+        D.drawFastHLine(0, 0, 6, T->accent1); D.drawFastVLine(0, 0, 6, T->accent1);
+        D.drawFastHLine(SCREEN_W-6, 0, 6, T->accent1); D.drawFastVLine(SCREEN_W-1, 0, 6, T->accent1);
+    }
+    // ── GLITCH TERMINAL ───────────────────────────────────────
+    else if (themeIdx == 1) {
+        D.setTextDatum(middle_left);
+        D.setTextColor(T->textDim);
+        D.drawString("BRKN_SIGNAL // RADIO", 4, 7, 1);
+        D.setTextColor(radioIsPlaying ? T->accent1 : T->textDim);
+        D.setTextDatum(middle_right);
+        D.drawString(wifiConnected ? wifiStatus : "NO WIFI", SCREEN_W-4, 7, 1);
+        const int CUR_X = 4, CUR_W = 5, CUR_GAP = 3;
+        D.fillRect(CUR_X, 16, CUR_W, 10, (radioIsPlaying && cursorVisible) ? T->accent1 : T->hdrBg);
+        D.setTextColor(radioIsPlaying ? T->accent1 : T->textMid);
+        D.setTextDatum(middle_left);
+        D.drawString(stationLine, CUR_X + CUR_W + CUR_GAP, 22, 2);
+        for (int x = 0; x < SCREEN_W; x += 5) D.drawFastHLine(x, HEADER_H-1, 3, T->textDim);
+    }
+    // ── CORPO CHROME / MIAMI VICE / ASH ───────────────────────
+    else {
+        D.fillRect(0, 0, 3, HEADER_H, T->accent1);
+        D.drawFastVLine(0, 0, HEADER_H/2, T->accent2);
+        D.setTextDatum(middle_left);
+        D.setTextColor(radioIsPlaying ? T->accent1 : T->textDim);
+        D.drawString(radioIsPlaying ? "* ON AIR" : "* WEB RADIO", 8, 7, 1);
+        D.setTextColor(wifiConnected ? T->accent3 : T->textDim);
+        D.setTextDatum(middle_right);
+        D.drawString(wifiStatus, SCREEN_W-4, 7, 1);
+        D.setTextColor(T->textBright);
+        D.setTextDatum(middle_left);
+        D.drawString(stationLine, 8, 22, 2);
+        D.drawFastHLine(3, HEADER_H-1, SCREEN_W-3, T->textDim);
+        if (themeIdx == 3) {
+            D.drawFastHLine(0, HEADER_H-2, SCREEN_W, T->accent2);
+            D.drawFastHLine(0, HEADER_H-1, SCREEN_W, rgb(0,80,70));
+        } else if (themeIdx == 4) {
+            D.drawFastHLine(0, HEADER_H-1, SCREEN_W, T->accent1);
+        }
+    }
+
+    if (hdrMsgEnd > 0 && millis() < hdrMsgEnd) {
+        D.setTextDatum(middle_right);
+        D.setTextColor(T->accent2);
+        D.drawString(hdrMsg, SCREEN_W-4, 22, 1);
+    }
+
+    headerCanvas.pushSprite(0, 0);
+    #undef D
+}
+
+// =============================================================
+//  drawRadioRow — draw one station row directly to the display.
+//  idx is the absolute station index (0-based).  No-ops if the
+//  row is scrolled out of view or out of range.
+// =============================================================
+void drawRadioRow(int idx) {
+    if (idx < radioScrollTop || idx >= radioScrollTop + VISIBLE_TRACKS) return;
+    if (idx < 0 || idx >= radioCount) return;
+
+    auto& D  = M5Cardputer.Display;
+    int sbW  = (themeIdx == 1) ? 7 : 3;
+    int i    = idx - radioScrollTop;
+    int y    = LIST_Y + i * LIST_ITEM_H;
+    int midY = y + LIST_ITEM_H / 2;
+    bool sel  = (idx == radioSelected);
+    bool play = (idx == radioPlaying && radioIsPlaying);
+
+    // Row background — capped at SCREEN_W-sbW so the scrollbar column is
+    // never overwritten by targeted single-row updates.
+    int rowW = SCREEN_W - sbW;
+    if (themeIdx == 0) {
+        if (sel) {
+            D.fillRect(0,        y, rowW/2,        LIST_ITEM_H, T->selRow);
+            D.fillRect(rowW/2,   y, rowW - rowW/2, LIST_ITEM_H, T->bg);
+        } else {
+            D.fillRect(0, y, rowW, LIST_ITEM_H, T->bg);
+        }
+        D.drawFastHLine(0, y+LIST_ITEM_H-1, rowW, rgb(9,21,32));
+    } else if (themeIdx == 1) {
+        D.fillRect(0, y, rowW, LIST_ITEM_H, sel ? T->selRow : T->bg);
+    } else {
+        if (sel) {
+            D.fillRect(0,  y, 80,        LIST_ITEM_H, rgb(20,16,10));
+            D.fillRect(80, y, rowW - 80, LIST_ITEM_H, T->bg);
+        } else {
+            D.fillRect(0, y, rowW, LIST_ITEM_H, T->bg);
+        }
+        D.drawFastHLine(0, y+LIST_ITEM_H-1, rowW, T->textDim);
+    }
+
+    // Left indicator bar
+    if (themeIdx == 0 || themeIdx == 3) {
+        if (play)      D.fillRect(3, y, 3, LIST_ITEM_H, T->accent1);
+        else if (sel)  D.fillRect(3, y, 2, LIST_ITEM_H, T->accent2);
+    } else if (themeIdx == 2) {
+        if (play)      D.fillRect(3, y+3, 3, LIST_ITEM_H-6, T->accent1);
+        if (sel) {
+            D.drawFastHLine(SCREEN_W-sbW-7, y+3, 5, T->accent2);
+            D.drawFastVLine(SCREEN_W-sbW-3, y+3, 5, T->accent2);
+        }
+    } else if (themeIdx == 4) {
+        if (sel)  D.drawFastVLine(0, y, LIST_ITEM_H, T->accent1);
+        if (play) D.drawFastVLine(1, y, LIST_ITEM_H, T->accent2);
+    }
+
+    // Number prefix
+    char numBuf[4]; snprintf(numBuf, sizeof(numBuf), "%02d", idx + 1);
+    if (themeIdx == 1) {
+        D.setTextDatum(middle_left);
+        if (play)      { D.setTextColor(T->accent1); D.drawString(">", 2, midY, 1); }
+        else if (sel)  { D.setTextColor(T->accent2); D.drawString("|", 2, midY, 1); }
+        D.setTextColor(T->textDim);
+        D.drawString(numBuf, 12, midY, 1);
+    } else {
+        uint16_t nc = (themeIdx == 4) ? T->textDim
+                    : play ? T->accent1 : (sel ? T->accent2 : T->textDim);
+        D.setTextColor(nc);
+        D.setTextDatum(middle_left);
+        D.drawString(numBuf, 8, midY, 1);
+    }
+
+    // Station name
+    int nameX    = (themeIdx == 1) ? 30 : 26;
+    String lbl   = radioList[idx].name;
+    int maxChars = (themeIdx == 1) ? 31 : 30;
+    if ((int)lbl.length() > maxChars) lbl = lbl.substring(0, maxChars-1) + ">";
+    uint16_t nc;
+    if (themeIdx == 1) nc = play ? T->accent1 : (sel ? T->accent2 : T->textMid);
+    else               nc = play ? T->accent1 : (sel ? T->textBright : T->textMid);
+    D.setTextColor(nc);
+    D.setTextDatum(middle_left);
+    D.drawString(lbl, nameX, midY, 1);
+
+    // Neon Noir: scanline glow on playing row
+    if (themeIdx == 0 && play) {
+        uint16_t glowCol = rgb(80,0,40);
+        D.drawFastHLine(0, y,               rowW, glowCol);
+        D.drawFastHLine(0, y+LIST_ITEM_H-1, rowW, glowCol);
+    }
+    // Terminal: cursor (cursorVisible reflects current blink state)
+    if (themeIdx == 1 && sel) {
+        uint16_t cur = cursorVisible ? T->accent1 : T->bg;
+        D.fillRect(SCREEN_W - sbW - 8, y+3, 5, LIST_ITEM_H-6, cur);
+    }
+}
+
+// =============================================================
+//  drawRadioList — full repaint of the list area.
+//  Calls drawRadioRow() per row so rendering logic lives in one place.
+// =============================================================
+void drawRadioList() {
+    auto& D  = M5Cardputer.Display;
+    int sbW  = (themeIdx == 1) ? 7 : 3;
+
+    D.drawFastHLine(0, HEADER_H,   SCREEN_W, T->bg);
+    D.drawFastHLine(0, STATUS_Y-1, SCREEN_W, T->bg);
+
+    if (radioCount == 0) {
+        D.fillRect(0, LIST_Y, SCREEN_W, VISIBLE_TRACKS * LIST_ITEM_H, T->bg);
+        D.setTextDatum(middle_center);
+        D.setTextColor(T->textDim);
+        D.drawString("No stations saved.", SCREEN_W/2, LIST_Y + 28, 1);
+        D.drawString("Press A to add one.", SCREEN_W/2, LIST_Y + 42, 1);
+        return;
+    }
+
+    int visCount = min(VISIBLE_TRACKS, radioCount - radioScrollTop);
+    for (int i = 0; i < visCount; i++)
+        drawRadioRow(radioScrollTop + i);
+    // Clear any unused rows below the station list
+    for (int i = visCount; i < VISIBLE_TRACKS; i++)
+        D.fillRect(0, LIST_Y + i * LIST_ITEM_H, SCREEN_W, LIST_ITEM_H, T->bg);
+
+    // Scrollbar
+    if (radioCount > VISIBLE_TRACKS) {
+        int listH = VISIBLE_TRACKS * LIST_ITEM_H;
+        int thH   = max(5, listH * VISIBLE_TRACKS / radioCount);
+        int thY   = LIST_Y + (listH - thH) * radioScrollTop / max(1, radioCount - VISIBLE_TRACKS);
+        int sbX   = SCREEN_W - sbW;
+        if (themeIdx == 1) {
+            D.fillRect(sbX, LIST_Y, sbW, listH, T->bg);   // clear old thumb before redraw
+            D.drawFastVLine(sbX, LIST_Y, listH, T->textDim);
+            D.fillRect(sbX+1, thY, sbW-1, thH, T->textDim);
+            D.drawRect( sbX+1, thY, sbW-1, thH, T->textMid);
+        } else {
+            D.fillRect(sbX, LIST_Y, sbW, listH, T->barBg);
+            D.fillRect(sbX, thY,    sbW, thH,   themeIdx == 2 ? T->accent2 : T->accent1);
+        }
+    }
+}
+
+// =============================================================
+//  drawRadioStatus — bottom bar for radio mode
+//  Shows: [A:ADD] [X:RMV] | stream indicator | vol | bat
+// =============================================================
+void drawRadioStatus() {
+    int volPct = (volume * 100) / 255;
+    statusCanvas.fillSprite(T->hdrBg);
+
+    const char* streamLabel  = radioIsPlaying ? "LIVE" : "IDLE";
+    uint16_t    streamCol    = radioIsPlaying ? T->accent1 : T->textDim;
+
+    // ── NEON NOIR ─────────────────────────────────────────────
+    if (themeIdx == 0) {
+        statusCanvas.drawFastHLine(0, 0, SCREEN_W, T->textDim);
+        // Add / Remove buttons left side
+        statusCanvas.setTextDatum(middle_left);
+        statusCanvas.setTextColor(T->accent2);
+        statusCanvas.drawString("A", 4, STATUS_H/2, 1);
+        statusCanvas.setTextColor(T->textDim);
+        statusCanvas.drawString(":ADD", 10, STATUS_H/2, 1);
+        statusCanvas.setTextColor(T->accent2);
+        statusCanvas.drawString("X", 38, STATUS_H/2, 1);
+        statusCanvas.setTextColor(T->textDim);
+        statusCanvas.drawString(":RMV", 44, STATUS_H/2, 1);
+        // Stream status
+        statusCanvas.setTextDatum(middle_center);
+        statusCanvas.setTextColor(streamCol);
+        statusCanvas.drawString(streamLabel, SCREEN_W/2, STATUS_H/2, 1);
+        // Vol + bat right
+        char vbuf[8]; snprintf(vbuf, sizeof(vbuf), "VOL %d", volPct);
+        statusCanvas.setTextColor(T->accent3);
+        statusCanvas.setTextDatum(middle_right);
+        statusCanvas.drawString(vbuf, SCREEN_W-2, 5, 1);
+        if (batteryLevel >= 0) {
+            char bbuf[8]; snprintf(bbuf, sizeof(bbuf), "BAT %d%%", batteryLevel);
+            statusCanvas.setTextColor(T->textMid);
+            statusCanvas.drawString(bbuf, SCREEN_W-2, 13, 1);
+        }
+        statusCanvas.drawFastHLine(0,        STATUS_H-1, 5, T->accent2);
+        statusCanvas.drawFastVLine(0,        STATUS_H-5, 5, T->accent2);
+    }
+    // ── GLITCH TERMINAL ───────────────────────────────────────
+    else if (themeIdx == 1) {
+        for (int x = 0; x < SCREEN_W; x += 5)
+            statusCanvas.drawFastHLine(x, 0, 3, T->textDim);
+        statusCanvas.setTextDatum(middle_left);
+        statusCanvas.setTextColor(T->textDim);
+        statusCanvas.drawString("[A]ADD [X]RMV", 2, STATUS_H/2, 1);
+        statusCanvas.setTextColor(streamCol);
+        statusCanvas.setTextDatum(middle_center);
+        statusCanvas.drawString(streamLabel, SCREEN_W/2, STATUS_H/2, 1);
+        char vtag[10]; snprintf(vtag, sizeof(vtag), "VOL:%d", volPct);
+        statusCanvas.setTextDatum(middle_right);
+        statusCanvas.setTextColor(T->textDim);
+        statusCanvas.drawString(vtag, SCREEN_W-2, 5, 1);
+        if (batteryLevel >= 0) {
+            char bbuf[8]; snprintf(bbuf, sizeof(bbuf), "B:%d%%", batteryLevel);
+            statusCanvas.setTextColor(T->accent2);
+            statusCanvas.drawString(bbuf, SCREEN_W-2, 13, 1);
+        }
+    }
+    // ── CORPO CHROME ──────────────────────────────────────────
+    else if (themeIdx == 2) {
+        statusCanvas.drawFastHLine(0, 0, SCREEN_W, T->textDim);
+        statusCanvas.setTextDatum(middle_left);
+        statusCanvas.setTextColor(T->accent2);
+        statusCanvas.drawString("A", 4, STATUS_H/2, 1);
+        statusCanvas.setTextColor(T->textMid);
+        statusCanvas.drawString(":ADD", 10, STATUS_H/2, 1);
+        statusCanvas.setTextColor(T->accent2);
+        statusCanvas.drawString("X", 40, STATUS_H/2, 1);
+        statusCanvas.setTextColor(T->textMid);
+        statusCanvas.drawString(":RMV", 46, STATUS_H/2, 1);
+        statusCanvas.setTextColor(streamCol);
+        statusCanvas.setTextDatum(middle_center);
+        statusCanvas.drawString(streamLabel, SCREEN_W/2, STATUS_H/2, 1);
+        char vbuf[6]; snprintf(vbuf, sizeof(vbuf), "%d", volPct);
+        statusCanvas.setTextDatum(middle_right);
+        statusCanvas.setTextColor(T->accent2);
+        statusCanvas.drawString(vbuf, SCREEN_W-2, 5, 1);
+        statusCanvas.setTextColor(T->textMid);
+        statusCanvas.drawString("VOL", SCREEN_W-2-(int)strlen(vbuf)*6-4, 5, 1);
+        if (batteryLevel >= 0) {
+            char bbuf[6]; snprintf(bbuf, sizeof(bbuf), "%d%%", batteryLevel);
+            statusCanvas.setTextColor(T->textBright);
+            statusCanvas.drawString(bbuf, SCREEN_W-2, 13, 1);
+            statusCanvas.setTextColor(T->textMid);
+            statusCanvas.drawString("BAT", SCREEN_W-2-(int)strlen(bbuf)*6-4, 13, 1);
+        }
+    }
+    // ── MIAMI VICE ────────────────────────────────────────────
+    else if (themeIdx == 3) {
+        statusCanvas.drawFastHLine(0, 0, SCREEN_W, T->accent2);
+        statusCanvas.setTextDatum(middle_left);
+        statusCanvas.setTextColor(T->accent2);
+        statusCanvas.drawString("A", 4, STATUS_H/2, 1);
+        statusCanvas.setTextColor(T->textDim);
+        statusCanvas.drawString(":ADD", 10, STATUS_H/2, 1);
+        statusCanvas.setTextColor(T->accent2);
+        statusCanvas.drawString("X", 38, STATUS_H/2, 1);
+        statusCanvas.setTextColor(T->textDim);
+        statusCanvas.drawString(":RMV", 44, STATUS_H/2, 1);
+        statusCanvas.setTextColor(streamCol);
+        statusCanvas.setTextDatum(middle_center);
+        statusCanvas.drawString(streamLabel, SCREEN_W/2, STATUS_H/2, 1);
+        char vbuf[8]; snprintf(vbuf, sizeof(vbuf), "VOL %d", volPct);
+        statusCanvas.setTextColor(T->accent3);
+        statusCanvas.setTextDatum(middle_right);
+        statusCanvas.drawString(vbuf, SCREEN_W-2, 5, 1);
+        if (batteryLevel >= 0) {
+            char bbuf[8]; snprintf(bbuf, sizeof(bbuf), "BAT %d%%", batteryLevel);
+            statusCanvas.setTextColor(T->accent2);
+            statusCanvas.drawString(bbuf, SCREEN_W-2, 13, 1);
+        }
+    }
+    // ── ASH ───────────────────────────────────────────────────
+    else {
+        statusCanvas.drawFastHLine(0, 0, SCREEN_W, T->textDim);
+        statusCanvas.setTextDatum(middle_left);
+        statusCanvas.setTextColor(T->textMid);
+        statusCanvas.drawString("A:ADD", 4, STATUS_H/2, 1);
+        statusCanvas.drawString("X:RMV", 38, STATUS_H/2, 1);
+        statusCanvas.setTextColor(streamCol);
+        statusCanvas.setTextDatum(middle_center);
+        statusCanvas.drawString(streamLabel, SCREEN_W/2, STATUS_H/2, 1);
+        // Vol blocks
+        int litBlocks = (int)(volPct * 6 / 100.0f + 0.5f);
+        int batW = (batteryLevel >= 0) ? 28 : 0;
+        int bx0  = SCREEN_W - 2 - batW - (6 * 6 - 2);
+        for (int b = 0; b < 6; b++) {
+            int bx = bx0 + b * 6;
+            statusCanvas.fillRect(bx, (STATUS_H-5)/2, 4, 5, b < litBlocks ? T->accent2 : T->textDim);
+        }
+        if (batteryLevel >= 0) {
+            char bbuf[6]; snprintf(bbuf, sizeof(bbuf), "%d%%", batteryLevel);
+            statusCanvas.setTextColor(T->textDim);
+            statusCanvas.setTextDatum(middle_left);
+            int sepX = bx0 + 34 + 4;
+            statusCanvas.drawString("|", sepX, STATUS_H/2, 1);
+            statusCanvas.drawString(bbuf, sepX + 8, STATUS_H/2, 1);
+        }
+    }
+
+    statusCanvas.pushSprite(0, STATUS_Y);
+}
+
+// =============================================================
+//  drawRadioAll — full repaint for radio mode
+// =============================================================
+void drawRadioAll() {
+    drawRadioHeader();
+    drawRadioList();
+    drawRadioStatus();
+}
+
+// =============================================================
+//  handleOverlayInput — keyboard handler when an overlay is open
+// =============================================================
+void handleOverlayInput(Keyboard_Class::KeysState& ks) {
+    // ── WiFi network list overlay ──────────────────────────────
+    if (wifiOverlayVisible) {
+        for (auto c : ks.word) {
+            if (c == ';' && wifiNetCount > 0) {
+                wifiNetSel = (wifiNetSel - 1 + wifiNetCount) % wifiNetCount;
+                if (wifiNetSel < wifiNetScroll) wifiNetScroll = wifiNetSel;
+                drawWifiOverlay();
+            }
+            if (c == '.' && wifiNetCount > 0) {
+                wifiNetSel = (wifiNetSel + 1) % wifiNetCount;
+                if (wifiNetSel >= wifiNetScroll + 6) wifiNetScroll = wifiNetSel - 5;
+                drawWifiOverlay();
+            }
+            if (c == 's' || c == 'S') {
+                M5Cardputer.Display.setTextDatum(middle_center);
+                M5Cardputer.Display.setTextColor(T->accent2);
+                M5Cardputer.Display.drawString("SCANNING...", SCREEN_W/2, 68, 1);
+                scanWifiNetworks();
+                wifiNetSel = 0; wifiNetScroll = 0;
+                drawWifiOverlay();
+            }
+        }
+        if (ks.enter && wifiNetCount > 0) {
+            String ssid = wifiNets[wifiNetSel].ssid;
+            String cfgSsid, cfgPass;
+            wifiOverlayVisible = false;
+            if (loadWifiConfig(cfgSsid, cfgPass) && cfgSsid == ssid) {
+                if (connectWifi(ssid, cfgPass)) drawRadioAll();
+                else showWifiOverlay();
+            } else {
+                showWifiPassOverlay(ssid);
+            }
+        }
+        if (ks.del) {
+            wifiOverlayVisible = false;
+            if (!wifiConnected) exitWebRadioMode();
+            else drawRadioAll();
+        }
+    }
+    // ── WiFi password overlay ──────────────────────────────────
+    else if (wifiPassOverlayVisible) {
+        for (auto c : ks.word) {
+            if (c >= 32 && c < 127 && inputLen < RADIO_INPUT_MAX) {
+                inputBuf[inputLen++] = c;
+                inputBuf[inputLen]   = '\0';
+                drawWifiPassOverlay(true);   // input field only — no frame flicker
+            }
+        }
+        if (ks.del) {
+            if (inputLen > 0) {
+                inputBuf[--inputLen] = '\0';
+                drawWifiPassOverlay(true);   // input field only — no frame flicker
+            } else {
+                wifiPassOverlayVisible = false;
+                showWifiOverlay();
+            }
+        }
+        if (ks.enter) {
+            String pass = String(inputBuf);
+            wifiPassOverlayVisible = false;
+            if (connectWifi(inputSaved, pass)) drawRadioAll();
+            else showWifiOverlay();
+        }
+    }
+    // ── Add station URL overlay ────────────────────────────────
+    else if (addUrlOverlayVisible) {
+        for (auto c : ks.word) {
+            if (c >= 32 && c < 127 && inputLen < RADIO_INPUT_MAX) {
+                inputBuf[inputLen++] = c;
+                inputBuf[inputLen]   = '\0';
+                drawAddUrlOverlay(true);     // input field only — no frame flicker
+            }
+        }
+        if (ks.del) {
+            if (inputLen > 0) {
+                inputBuf[--inputLen] = '\0';
+                drawAddUrlOverlay(true);     // input field only — no frame flicker
+            } else {
+                addUrlOverlayVisible = false;
+                drawRadioAll();
+            }
+        }
+        if (ks.enter && inputLen > 0) {
+            inputSaved = String(inputBuf);
+            addUrlOverlayVisible = false;
+            String defName = generateRadioName(inputSaved, radioCount + 1);
+            showAddNameOverlay(defName);
+        }
+    }
+    // ── Station name overlay ───────────────────────────────────
+    else if (addNameOverlayVisible) {
+        for (auto c : ks.word) {
+            if (c >= 32 && c < 127 && inputLen < 31) {
+                inputBuf[inputLen++] = c;
+                inputBuf[inputLen]   = '\0';
+                drawAddNameOverlay(true);    // input field only — no frame flicker
+            }
+        }
+        if (ks.del && inputLen > 0) {
+            inputBuf[--inputLen] = '\0';
+            drawAddNameOverlay(true);        // input field only — no frame flicker
+        }
+        if (ks.enter) {
+            if (radioCount < RADIO_MAX) {
+                radioList[radioCount].url  = inputSaved;
+                radioList[radioCount].name = (inputLen > 0)
+                    ? String(inputBuf) : ("Radio " + String(radioCount + 1));
+                radioCount++;
+                saveRadioList();
+                radioSelected  = radioCount - 1;
+                radioScrollTop = max(0, radioSelected - VISIBLE_TRACKS + 1);
+            }
+            addNameOverlayVisible = false;
+            drawRadioAll();
+        }
+    }
+    // ── Remove confirm overlay ─────────────────────────────────
+    else if (removeConfirmVisible) {
+        if (ks.enter) {
+            if (radioSelected == radioPlaying && radioIsPlaying) stopRadioStream();
+            for (int i = radioSelected; i < radioCount - 1; i++)
+                radioList[i] = radioList[i+1];
+            radioCount--;
+            if (radioPlaying >= radioCount) radioPlaying = -1;
+            if (radioSelected >= radioCount) radioSelected = max(0, radioCount - 1);
+            radioScrollEnsureVisible();
+            saveRadioList();
+            removeConfirmVisible = false;
+            drawRadioAll();
+        }
+        if (ks.del) {
+            removeConfirmVisible = false;
+            drawRadioAll();
+        }
+    }
+}
+
+// =============================================================
+//  handleRadioInput — keyboard handler in radio list view
+// =============================================================
+void handleRadioInput(Keyboard_Class::KeysState& ks) {
+    if (ks.del) { exitWebRadioMode(); return; }
+
+    if (ks.enter) {
+        if (radioCount == 0) { showAddUrlOverlay(); return; }
+        if (radioIsPlaying && radioPlaying == radioSelected) {
+            int oldPlaying = radioPlaying;
+            stopRadioStream();
+            drawRadioRow(oldPlaying);
+            drawRadioHeader();
+            drawRadioStatus();
+        } else {
+            startRadioStream(radioSelected);
+        }
+    }
+
+    for (auto c : ks.word) {
+        switch (c) {
+            case ';':
+                if (radioCount > 0) {
+                    int oldSel = radioSelected, oldScroll = radioScrollTop;
+                    radioSelected = (radioSelected - 1 + radioCount) % radioCount;
+                    radioScrollEnsureVisible();
+                    if (radioScrollTop != oldScroll) drawRadioList();
+                    else { drawRadioRow(oldSel); drawRadioRow(radioSelected); }
+                }
+                break;
+            case '.':
+                if (radioCount > 0) {
+                    int oldSel = radioSelected, oldScroll = radioScrollTop;
+                    radioSelected = (radioSelected + 1) % radioCount;
+                    radioScrollEnsureVisible();
+                    if (radioScrollTop != oldScroll) drawRadioList();
+                    else { drawRadioRow(oldSel); drawRadioRow(radioSelected); }
+                }
+                break;
+            case ' ':
+                if (radioIsPlaying && radioPlaying == radioSelected) {
+                    int oldPlaying = radioPlaying;
+                    stopRadioStream();
+                    drawRadioRow(oldPlaying);
+                    drawRadioHeader();
+                    drawRadioStatus();
+                } else if (radioCount > 0) {
+                    startRadioStream(radioSelected);
+                }
+                break;
+            case 'a': case 'A':
+                if (radioCount < RADIO_MAX) showAddUrlOverlay();
+                else showHdrMsg("LIST FULL");
+                break;
+            case 'x': case 'X':
+                if (radioCount > 0) showRemoveConfirm();
+                break;
+            case 'w': case 'W':
+                exitWebRadioMode();
+                return;
+            case '+': case '=':
+                volume = (uint8_t)min(255, (int)volume + 10);
+                M5Cardputer.Speaker.setVolume(volume);
+                settingsDirty = true; settingsDirtyMs = millis();
+                drawRadioStatus();
+                break;
+            case '-':
+                volume = (uint8_t)max(0, (int)volume - 10);
+                M5Cardputer.Speaker.setVolume(volume);
+                settingsDirty = true; settingsDirtyMs = millis();
+                drawRadioStatus();
+                break;
+            case '1': setTheme(0); break;
+            case '2': setTheme(1); break;
+            case '3': setTheme(2); break;
+            case '4': setTheme(3); break;
+            case '5': setTheme(4); break;
+            case 'o': case 'O': toggleScreen(); break;
+            case 'h': case 'H': toggleHelp();   break;
+        }
+    }
+}
+
+// =============================================================
+//  enterWebRadioMode — switch from music player to web radio
+// =============================================================
+void enterWebRadioMode() {
+    purgeAudioPlayerMemory();   // free folder caches to give RAM to WiFi
+    webRadioMode  = true;
+    radioSelected = 0;
+    radioScrollTop= 0;
+    loadRadioList();
+
+    // Check if WiFi is already up from a previous session
+    if (WiFi.status() == WL_CONNECTED) {
+        wifiConnected = true;
+        wifiSSID      = WiFi.SSID();
+        drawRadioAll();
+        return;
+    }
+
+    // Try auto-connect from saved config
+    String cfgSsid, cfgPass;
+    if (loadWifiConfig(cfgSsid, cfgPass) && cfgSsid.length() > 0) {
+        if (connectWifi(cfgSsid, cfgPass)) {
+            drawRadioAll();
+            return;
+        }
+    }
+
+    // Fall back to network scan overlay
+    showWifiOverlay();
+}
+
+// =============================================================
+//  exitWebRadioMode — return to music player, free WiFi RAM
+// =============================================================
+void exitWebRadioMode() {
+    purgeRadioMemory();         // stops stream, disconnects WiFi, frees ~100KB
+    webRadioMode           = false;
+    wifiOverlayVisible     = false;
+    wifiPassOverlayVisible = false;
+    addUrlOverlayVisible   = false;
+    addNameOverlayVisible  = false;
+    removeConfirmVisible   = false;
+    helpVisible            = false;
+
+    // Rebuild music folder tree (root only; subfolders lazy)
+    allFolders.clear(); allFolders.shrink_to_fit();
+    scanLRUCount = 0;
+    folderStack.clear();
+    folderPage   = 0;
+    currentFolderIdx = 0;
+    isRecentView = false;
+    scanDir("/Music", "Music");
+    loadFolderIdx(0);
+    drawAll();
 }
