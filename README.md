@@ -4,8 +4,6 @@ Audio player and web radio for the **M5Stack Cardputer ADV**. Plays MP3 and M4A 
 
 ![Screenshot](images/BrokenSignal.png)
 
--> Support: [Ko-fi](https://ko-fi.com/marcorr)  
-
 ---
 
 ## Features
