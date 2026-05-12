@@ -147,11 +147,10 @@ Install both libraries via the Arduino Library Manager or the links below:
 ---
 
 ## Screenshots
-
-![Glitch Terminal theme](images/cardputer.png)
-![Glitch Terminal theme](images/theme2.png)
-![Corpo Chrome theme](/images/theme3.png)
-![Miami Vice theme](images/theme4.png)
+<img src="images/cardputer.png" width="400" height="242" vspace="10">
+<img src="images/theme2.png" width="400" height="242" vspace="10">
+<img src="images/theme3.png" width="400" height="242" vspace="10">
+<img src="images/theme4.png" width="400" height="242" vspace="10">
 
 
 ---
